@@ -50,7 +50,14 @@ const assignmentModule = {
     { label: 'Modified', timestamp: 1713500000 },
   ],
 }
-assert.equal(extractModuleTimestamp(assignmentModule), 1713500000)
+const noDateModule = {
+  id: 4214,
+  name: 'Online Session 1 F',
+  modname: 'url',
+  visible: 1,
+  uservisible: false,
+}
+assert.equal(extractModuleTimestamp(noDateModule), 0)
 console.log('   ✅ Timestamp extraction rules passed.')
 
 // ---------------------------------------------------------------------------
@@ -107,6 +114,10 @@ assert.equal(staleResult, null)
 // Filter exclusion test (assignments are disabled in filterConfig)
 const assignResult = evaluateModuleDelta(courseId, assignmentModule, undefined, filterConfig)
 assert.equal(assignResult, null)
+
+// Restricted cohort exclusion test (uservisible === false)
+const restrictedResult = evaluateModuleDelta(courseId, noDateModule, undefined, filterConfig)
+assert.equal(restrictedResult, null)
 console.log('   ✅ Module delta engine state transitions passed.')
 
 // ---------------------------------------------------------------------------

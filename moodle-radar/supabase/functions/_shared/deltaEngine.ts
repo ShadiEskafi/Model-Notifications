@@ -71,7 +71,7 @@ export function extractModuleTimestamp(module: MoodleModule): number {
   const genericModified = module.dates?.find((d) => d.label?.toLowerCase().includes('modified'))
   if (genericModified) return genericModified.timestamp
 
-  return Math.floor(Date.now() / 1000)
+  return 0 // Static fallback - NEVER return dynamic Date.now() to prevent infinite EVENT_UPDATED loops
 }
 
 /**
@@ -102,7 +102,8 @@ export function evaluateModuleDelta(
   existingWatermark: StoredItemState | undefined,
   filterConfig: CourseFilterConfig
 ): DeltaEvent | null {
-  if (!module.visible) return null
+  // Discard hidden modules or modules restricted from this student's cohort (e.g. other gender/branch sections)
+  if (!module.visible || module.uservisible === false) return null
 
   let itemType: 'mod_forum' | 'mod_assign' | 'mod_resource' | 'mod_url'
   if (module.modname === 'assign') {
@@ -167,7 +168,7 @@ export function evaluateDiscussionDelta(
 
   const itemType = 'mod_forum'
   const compositeId = buildCompositeId(courseId, itemType, discussion.id)
-  const incomingTime = discussion.timemodified || discussion.created || Math.floor(Date.now() / 1000)
+  const incomingTime = discussion.timemodified || discussion.created || 0
 
   // Case A: New Discussion
   if (!existingWatermark) {

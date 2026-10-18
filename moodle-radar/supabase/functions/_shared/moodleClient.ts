@@ -71,6 +71,7 @@ export interface MoodleModule {
   modplural?: string
   url?: string
   visible?: number
+  uservisible?: boolean
   dates?: MoodleModuleDate[]
   contents?: MoodleModuleContent[]
   contentsinfo?: {
