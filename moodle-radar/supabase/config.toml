@@ -1,0 +1,11 @@
+# Supabase Configuration for Moodle Radar
+project_id = "xhilmsuvjuwoivyseoyz"
+
+[functions.sync-courses]
+verify_jwt = false
+
+[functions.moodle-poller]
+verify_jwt = false
+
+[functions.telegram-webhook]
+verify_jwt = false
