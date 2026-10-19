@@ -87,12 +87,19 @@ export default function CourseRow({
       {/* 3. Donor Token */}
       <td className="py-4 px-4 whitespace-nowrap">
         <div>
-          <div className="font-bold text-slate-800">
-            {course.donor_tokens?.label || 'توكن مباشر'}
+          <div className="flex items-center gap-1.5">
+            <span className="font-bold text-slate-800">
+              {course.donor_tokens?.label || 'توكن مباشر'}
+            </span>
+            {course.donor_tokens?.status === 'revoked' && (
+              <span className="px-1.5 py-0.5 text-[9px] font-bold bg-rose-50 text-rose-700 border border-rose-200 rounded">
+                التوكن ملغي
+              </span>
+            )}
           </div>
           {course.fallback_token_id && (
             <span className="inline-block mt-0.5 text-[10px] font-semibold text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
-              احتياطي مفعل
+              احتياطي مفعل{course.fallback_donor?.label ? ` (${course.fallback_donor.label})` : ''}
             </span>
           )}
         </div>

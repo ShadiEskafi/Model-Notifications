@@ -22,7 +22,7 @@ Deno.serve(async (req: Request) => {
 
   try {
     const body = await req.json().catch(() => ({}))
-    const { label, moodle_base_url, wstoken } = body
+    const { donor_id, label, moodle_base_url, wstoken } = body
 
     if (!label || typeof label !== 'string' || !label.trim()) {
       return errorResponse('Missing required parameter: label', 400, 'INVALID_LABEL')
@@ -35,6 +35,38 @@ Deno.serve(async (req: Request) => {
     const cleanBaseUrl = (moodle_base_url && typeof moodle_base_url === 'string')
       ? moodle_base_url.trim().replace(/\/+$/, '')
       : 'https://moodle.university.edu'
+
+    // Initialize elevated Supabase client
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') || ''
+    const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+    const supabase = createClient(supabaseUrl, serviceRoleKey)
+
+    // Lookup existing donor if donor_id or label is provided
+    let targetDonor = null
+    if (donor_id) {
+      const { data, error: findError } = await supabase
+        .from('donor_tokens')
+        .select('*')
+        .eq('id', donor_id)
+        .maybeSingle()
+
+      if (findError) {
+        throw new Error(`Database error querying donor token: ${findError.message}`)
+      }
+      if (!data) {
+        return errorResponse('تعذر العثور على سجل التوكن المحدد للتجديد', 404, 'DONOR_NOT_FOUND')
+      }
+      targetDonor = data
+    } else {
+      // Check if donor with same label exists
+      const { data: existingDonorByLabel } = await supabase
+        .from('donor_tokens')
+        .select('*')
+        .eq('label', label.trim())
+        .maybeSingle()
+
+      targetDonor = existingDonorByLabel || null
+    }
 
     // 1. Handshake with Moodle via core_webservice_get_site_info
     let siteInfo
@@ -49,6 +81,15 @@ Deno.serve(async (req: Request) => {
       return errorResponse(msg, 400, 'MOODLE_VALIDATION_ERROR')
     }
 
+    // Verify that the Moodle userid matches existing donor to prevent account mixing
+    if (targetDonor && targetDonor.moodle_user_id && siteInfo.userid !== targetDonor.moodle_user_id) {
+      return errorResponse(
+        `تعذر تحديث التوكن: رمز الوصول الجديد ينتمي لمستخدم مودل آخر (${siteInfo.fullname} - #${siteInfo.userid})، بينما هذا السجل مرتبط بـ (${targetDonor.moodle_user_fullname || 'الطالب'} - #${targetDonor.moodle_user_id}). يرجى إدخال توكن لنفس الطالب أو إضافة متبرع جديد.`,
+        400,
+        'DONOR_ACCOUNT_MISMATCH'
+      )
+    }
+
     // 2. Encrypt token via AES-256-GCM
     const masterKey = Deno.env.get('MASTER_ENCRYPTION_KEY') || Deno.env.get('ENCRYPTION_MASTER_KEY') || ''
     if (!masterKey) {
@@ -56,12 +97,7 @@ Deno.serve(async (req: Request) => {
     }
     const encrypted = await encryptToken(wstoken.trim(), masterKey)
 
-    // 3. Initialize elevated Supabase client
-    const supabaseUrl = Deno.env.get('SUPABASE_URL') || ''
-    const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
-    const supabase = createClient(supabaseUrl, serviceRoleKey)
-
-    // 4. Save or update donor token in donor_tokens table
+    // 3. Save or update donor token in donor_tokens table
     const donorPayload = {
       label: label.trim(),
       moodle_user_id: siteInfo.userid,
@@ -76,18 +112,13 @@ Deno.serve(async (req: Request) => {
       updated_at: new Date().toISOString(),
     }
 
-    const { data: existingDonor } = await supabase
-      .from('donor_tokens')
-      .select('id')
-      .eq('label', label.trim())
-      .maybeSingle()
-
     let donor: any = null
-    if (existingDonor) {
+    const isRenewal = Boolean(targetDonor)
+    if (targetDonor) {
       const { data: updated, error: updateError } = await supabase
         .from('donor_tokens')
         .update(donorPayload)
-        .eq('id', existingDonor.id)
+        .eq('id', targetDonor.id)
         .select()
         .single()
 
@@ -108,7 +139,7 @@ Deno.serve(async (req: Request) => {
       donor = inserted
     }
 
-    // 5. Discover enrolled courses from Moodle
+    // 4. Discover enrolled courses from Moodle
     let enrolledCourses = []
     try {
       enrolledCourses = await getUsersCourses(cleanBaseUrl, wstoken.trim(), siteInfo.userid)
@@ -169,6 +200,7 @@ Deno.serve(async (req: Request) => {
       moodle_user_id: siteInfo.userid,
       synced_courses_count: syncedCourses.length,
       courses: syncedCourses,
+      is_renewal: isRenewal,
     })
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err)

@@ -1,16 +1,21 @@
 import { useState } from 'react'
-import { X, KeyRound, ShieldCheck, AlertCircle, CheckCircle2, Loader2 } from 'lucide-react'
+import { X, KeyRound, ShieldCheck, AlertCircle, CheckCircle2, Loader2, AlertTriangle, RefreshCw } from 'lucide-react'
 import { supabase } from '../../lib/supabaseClient'
 
-export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
-  const [label, setLabel] = useState('')
-  const [moodleUrl, setMoodleUrl] = useState('https://moodle.university.edu')
+function OnboardDonorModalDialog({ onClose, onSuccess, donorToEdit = null }) {
+  const isEdit = Boolean(donorToEdit)
+  const [label, setLabel] = useState(donorToEdit?.label || '')
+  const [moodleUrl, setMoodleUrl] = useState(donorToEdit?.moodle_base_url || 'https://moodle.university.edu')
   const [wstoken, setWstoken] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [successData, setSuccessData] = useState(null)
 
-  if (!isOpen) return null
+  const handleClose = () => {
+    setError(null)
+    setSuccessData(null)
+    onClose()
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -18,13 +23,19 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
     setLoading(true)
 
     try {
+      const payload = {
+        label: label.trim(),
+        moodle_base_url: moodleUrl.trim(),
+        wstoken: wstoken.trim(),
+      }
+
+      if (isEdit && donorToEdit?.id) {
+        payload.donor_id = donorToEdit.id
+      }
+
       // Call Supabase Edge Function: /sync-courses
       const { data, error: funcError } = await supabase.functions.invoke('sync-courses', {
-        body: {
-          label: label.trim(),
-          moodle_base_url: moodleUrl.trim(),
-          wstoken: wstoken.trim(),
-        },
+        body: payload,
       })
 
       if (funcError) {
@@ -39,7 +50,7 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
             void e
           }
         }
-        throw new Error(msg || 'فشل استدعاء دالة المزامنة')
+        throw new Error(msg || 'فشل استدعاء دالة المزامنة والتجديد')
       }
 
       if (data && !data.success) {
@@ -48,23 +59,17 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
 
       setSuccessData(data)
       setTimeout(() => {
-        onSuccess()
+        onSuccess(data)
         handleClose()
       }, 1500)
     } catch (err) {
-      setError(err.message || 'حدث خطأ غير متوقع أثناء إضافة التوكن والتحقق منه.')
+      setError(err.message || 'حدث خطأ غير متوقع أثناء معالجة التوكن والتحقق منه.')
     } finally {
       setLoading(false)
     }
   }
 
-  const handleClose = () => {
-    setLabel('')
-    setWstoken('')
-    setError(null)
-    setSuccessData(null)
-    onClose()
-  }
+  const isFailing = isEdit && (donorToEdit.status === 'revoked' || donorToEdit.status === 'expired')
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-xs animate-in fade-in duration-150">
@@ -73,15 +78,17 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
         {/* Modal Header */}
         <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-2xl bg-blue-50 border border-blue-100 text-blue-600">
-              <KeyRound className="w-5 h-5" />
+            <div className={`p-2.5 rounded-2xl border ${isEdit ? 'bg-amber-50 border-amber-200 text-amber-700' : 'bg-blue-50 border-blue-100 text-blue-600'}`}>
+              {isEdit ? <RefreshCw className="w-5 h-5" /> : <KeyRound className="w-5 h-5" />}
             </div>
             <div>
               <h3 className="text-base font-extrabold text-slate-900 tracking-tight">
-                إضافة توكن متبرع جديد
+                {isEdit ? 'تجديد وتحديث توكن المتبرع' : 'إضافة توكن متبرع جديد'}
               </h3>
               <p className="text-xs text-slate-500 mt-0.5 font-medium">
-                تسجيل رمز وصول لطالب لاكتشاف مساقات الدفعة تلقائياً
+                {isEdit
+                  ? `تحديث رمز الوصول واستئناف مراقبة مساقات "${donorToEdit.label}"`
+                  : 'تسجيل رمز وصول لطالب لاكتشاف مساقات الدفعة تلقائياً'}
               </p>
             </div>
           </div>
@@ -96,6 +103,32 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
 
         {/* Modal Form */}
         <form onSubmit={handleSubmit} className="p-6 space-y-5">
+          {/* Diagnostic Warning for Revoked / Invalid Tokens */}
+          {isFailing && (
+            <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
+              <div>
+                <span className="font-bold">التوكن الحالي غير صالح ({donorToEdit.status === 'revoked' ? 'ملغي' : 'منتهي'}): </span>
+                <span className="font-medium">
+                  {donorToEdit.last_error_message || 'تم رفض التوكن من خادم مودل (invalidtoken). أدخل رمز وصول جديد لنفس الطالب لاستئناف مراقبة المقررات.'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Student Identity Guard Indicator */}
+          {isEdit && donorToEdit.moodle_user_fullname && (
+            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-700 text-[11px] flex items-center justify-between">
+              <div>
+                <span className="text-slate-500 font-medium">حساب الطالب المسجل: </span>
+                <span className="font-bold text-slate-900">{donorToEdit.moodle_user_fullname}</span>
+              </div>
+              <span className="font-mono text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200 text-[10px]">
+                معرف #{donorToEdit.moodle_user_id}
+              </span>
+            </div>
+          )}
+
           {error && (
             <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200/90 text-rose-800 text-xs flex items-start gap-3">
               <AlertCircle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
@@ -107,8 +140,11 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
             <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200/90 text-emerald-800 text-xs flex items-start gap-3">
               <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600 mt-0.5" />
               <div>
-                <span className="font-bold">نجحت المصافحة والربط!</span> تم الاتصال بحساب الطالب{' '}
-                <span className="underline font-bold">{successData.moodle_user_fullname || 'الطالب'}</span>. جارية مزامنة المقررات...
+                <span className="font-bold">
+                  {isEdit ? 'تم تحديث التوكن واستئناف المراقبة بنجاح!' : 'نجحت المصافحة والربط!'}
+                </span>{' '}
+                تم الاتصال بحساب الطالب{' '}
+                <span className="underline font-bold">{successData.moodle_user_fullname || 'الطالب'}</span>.
               </div>
             </div>
           )}
@@ -144,7 +180,8 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
 
           <div>
             <label className="block text-xs font-bold text-slate-700 mb-2">
-              رمز وصول خدمة الويب لمودل (`wstoken`) <span className="text-rose-500">*</span>
+              {isEdit ? 'رمز وصول مودل الجديد (`wstoken`)' : 'رمز وصول خدمة الويب لمودل (`wstoken`)'}{' '}
+              <span className="text-rose-500">*</span>
             </label>
             <input
               type="password"
@@ -152,7 +189,7 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
               dir="ltr"
               value={wstoken}
               onChange={(e) => setWstoken(e.target.value)}
-              placeholder="رمز مكون من 32 حرفاً سداسي عشري"
+              placeholder={isEdit ? 'أدخل رمز الوصول الجديد الصالح (32 حرفاً)' : 'رمز مكون من 32 حرفاً سداسي عشري'}
               className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 placeholder-slate-400 text-xs font-mono focus:outline-none focus:border-blue-600 focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all text-left"
             />
           </div>
@@ -178,20 +215,37 @@ export default function OnboardDonorModal({ isOpen, onClose, onSuccess }) {
             <button
               type="submit"
               disabled={loading || !!successData}
-              className="inline-flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold rounded-xl shadow-md shadow-blue-600/20 transition-all cursor-pointer"
+              className={`inline-flex items-center gap-2 px-5 py-2.5 text-white text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                isEdit
+                  ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20'
+                  : 'bg-blue-600 hover:bg-blue-700 shadow-blue-600/20'
+              }`}
             >
               {loading ? (
                 <>
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>جارٍ الاتصال والمزامنة...</span>
+                  <span>{isEdit ? 'جارٍ التحقق وتحديث التوكن...' : 'جارٍ الاتصال والمزامنة...'}</span>
                 </>
               ) : (
-                <span>التحقق والربط الآن</span>
+                <span>{isEdit ? 'التحقق وتحديث التوكن الآن' : 'التحقق والربط الآن'}</span>
               )}
             </button>
           </div>
         </form>
       </div>
     </div>
+  )
+}
+
+export default function OnboardDonorModal({ isOpen, onClose, onSuccess, donorToEdit = null }) {
+  if (!isOpen) return null
+
+  return (
+    <OnboardDonorModalDialog
+      key={donorToEdit?.id || 'new-donor'}
+      onClose={onClose}
+      onSuccess={onSuccess}
+      donorToEdit={donorToEdit}
+    />
   )
 }

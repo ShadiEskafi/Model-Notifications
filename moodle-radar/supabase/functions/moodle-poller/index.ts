@@ -47,10 +47,10 @@ Deno.serve(async (req: Request) => {
 
     const supabase = createClient(supabaseUrl, serviceRoleKey)
 
-    // 2. Fetch courses to poll
+    // 2. Fetch courses to poll (with primary and fallback donor relations)
     let query = supabase
       .from('courses')
-      .select('*, donor_tokens!donor_token_id(*)')
+      .select('*, donor_tokens!donor_token_id(*), fallback_donor:donor_tokens!fallback_token_id(*)')
 
     if (onDemandCourseId) {
       query = query.eq('id', onDemandCourseId)
@@ -87,9 +87,16 @@ Deno.serve(async (req: Request) => {
       }
 
       const targetCourse = courses[0]
-      const donor = targetCourse.donor_tokens
-      if (!donor) {
-        return errorResponse(`المساق #${targetCourse.id} غير مرتبط بأي حساب متبرع`, 400, 'NO_DONOR_TOKEN')
+      let donor = targetCourse.donor_tokens
+      if (!donor || donor.status !== 'active') {
+        const fallback = targetCourse.fallback_donor
+        if (fallback && fallback.status === 'active') {
+          console.log(`Test broadcast for course #${targetCourse.id}: primary donor inactive, using fallback donor #${fallback.id}`)
+          donor = fallback
+        }
+      }
+      if (!donor || donor.status !== 'active') {
+        return errorResponse(`المساق #${targetCourse.id} لا يمتلك أي حساب متبرع نشط (أساسي أو احتياطي)`, 400, 'NO_ACTIVE_DONOR_TOKEN')
       }
 
       // Decrypt token
@@ -338,15 +345,20 @@ Deno.serve(async (req: Request) => {
         await getJitterDelay(500, 1200)
       }
 
-      const donor = course.donor_tokens
-      if (!donor) {
-        console.warn(`Course #${course.id} has no assigned donor token. Skipping.`)
-        continue
-      }
-
-      if (donor.status !== 'active') {
-        console.warn(`Donor ${donor.id} is ${donor.status}. Skipping course #${course.id}.`)
-        continue
+      let donor = course.donor_tokens
+      if (!donor || donor.status !== 'active') {
+        const fallback = course.fallback_donor
+        if (fallback && fallback.status === 'active') {
+          console.log(
+            `Course #${course.id}: Primary donor (${donor?.id || 'none'}) is inactive (${donor?.status}). Using fallback donor #${fallback.id} (${fallback.label}).`
+          )
+          donor = fallback
+        } else {
+          console.warn(
+            `Course #${course.id}: No active primary or fallback donor available (Primary: ${donor?.status || 'none'}, Fallback: ${fallback?.status || 'none'}). Skipping.`
+          )
+          continue
+        }
       }
 
       // Retrieve or decrypt token

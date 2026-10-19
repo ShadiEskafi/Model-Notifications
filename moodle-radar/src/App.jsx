@@ -31,8 +31,24 @@ function DashboardContent() {
   })
 
   const [isDonorModalOpen, setIsDonorModalOpen] = useState(false)
+  const [selectedDonorForEdit, setSelectedDonorForEdit] = useState(null)
   const [isLogsModalOpen, setIsLogsModalOpen] = useState(false)
   const [toast, setToast] = useState(null)
+
+  const handleOpenAddDonor = useCallback(() => {
+    setSelectedDonorForEdit(null)
+    setIsDonorModalOpen(true)
+  }, [])
+
+  const handleEditDonor = useCallback((donor) => {
+    setSelectedDonorForEdit(donor)
+    setIsDonorModalOpen(true)
+  }, [])
+
+  const handleCloseDonorModal = useCallback(() => {
+    setIsDonorModalOpen(false)
+    setSelectedDonorForEdit(null)
+  }, [])
 
   const showToast = (message, type = 'success', duration = 4000) => {
     setToast({ message, type })
@@ -47,7 +63,7 @@ function DashboardContent() {
     try {
       const { data, error } = await supabase
         .from('courses')
-        .select('*, donor_tokens!donor_token_id(label, status)')
+        .select('*, donor_tokens!donor_token_id(label, status), fallback_donor:donor_tokens!fallback_token_id(label, status)')
         .order('id', { ascending: true })
 
       if (error) throw error
@@ -143,7 +159,7 @@ function DashboardContent() {
       Promise.all([
         supabase
           .from('courses')
-          .select('*, donor_tokens!donor_token_id(label, status)')
+          .select('*, donor_tokens!donor_token_id(label, status), fallback_donor:donor_tokens!fallback_token_id(label, status)')
           .order('id', { ascending: true }),
         supabase
           .from('donor_tokens')
@@ -359,7 +375,7 @@ function DashboardContent() {
       )}
 
       <Navbar
-        onOpenDonorModal={() => setIsDonorModalOpen(true)}
+        onOpenDonorModal={handleOpenAddDonor}
         onOpenLogsModal={() => setIsLogsModalOpen(true)}
       />
 
@@ -376,7 +392,7 @@ function DashboardContent() {
           </div>
           <button
             type="button"
-            onClick={() => setIsDonorModalOpen(true)}
+            onClick={handleOpenAddDonor}
             className="inline-flex items-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-xl text-xs font-bold shadow-md shadow-blue-600/20 transition-all cursor-pointer self-start sm:self-auto"
           >
             <Plus className="w-4 h-4" />
@@ -392,7 +408,8 @@ function DashboardContent() {
           donors={donors}
           courses={courses}
           loading={donorsLoading}
-          onOpenDonorModal={() => setIsDonorModalOpen(true)}
+          onOpenDonorModal={handleOpenAddDonor}
+          onEditDonor={handleEditDonor}
         />
 
         {/* Master Courses Table */}
@@ -408,16 +425,21 @@ function DashboardContent() {
           onToggleFilter={handleToggleFilter}
           onPollCourse={handlePollCourse}
           onTestBroadcast={handleTestBroadcast}
-          onOpenDonorModal={() => setIsDonorModalOpen(true)}
+          onOpenDonorModal={handleOpenAddDonor}
         />
       </Layout>
 
       {/* Modals & Drawers */}
       <OnboardDonorModal
         isOpen={isDonorModalOpen}
-        onClose={() => setIsDonorModalOpen(false)}
-        onSuccess={() => {
-          showToast('تم تسجيل توكن المتبرع واكتشاف المساقات بنجاح!')
+        donorToEdit={selectedDonorForEdit}
+        onClose={handleCloseDonorModal}
+        onSuccess={(data) => {
+          showToast(
+            data?.is_renewal
+              ? 'تم تجديد توكن المتبرع واستئناف مراقبة المقررات بنجاح!'
+              : 'تم تسجيل توكن المتبرع واكتشاف المساقات بنجاح!'
+          )
           fetchCourses()
           fetchDonors()
           fetchMetrics()
