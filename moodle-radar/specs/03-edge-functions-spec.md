@@ -197,3 +197,24 @@ export async function decryptToken(payload: EncryptedPayload): Promise<string> {
 
 #### Response:
 Always returns `200 OK` with `{ "ok": true }` to Telegram within 2 seconds to prevent webhook retries.
+
+
+---
+
+## 5. Reactive Self-Healing & Zero-Lockout Protocol in Edge Functions
+
+### 5.1 `/sync-courses` Onboarding with Opt-In Credentials
+- Accepts `auth_mode: 'credentials'` with `username` and `password`.
+- Validates credentials against Moodle `/login/token.php` to obtain the initial `wstoken`.
+- Encrypts both password and token with AES-256-GCM.
+- Sets `auto_refresh_enabled = TRUE`, `status = 'active'`, `auth_mode = 'credentials'`.
+
+### 5.2 `/moodle-poller` Reactive Recovery Workflow
+- Intercepts `MoodleApiError` with `invalidtoken` when polling course contents or discussions.
+- Checks if donor has `auth_mode === 'credentials'` and `auto_refresh_enabled === TRUE`.
+- Calls `attemptReactiveSelfHealing(supabase, donor, masterKey)`:
+  - Decrypts password in memory.
+  - POSTs to `/login/token.php`.
+  - **Zero-Lockout Protection:** If `/login/token.php` returns `invalidlogin`, halt immediately on the first attempt without retrying. Set `auto_refresh_enabled = FALSE`, `status = 'revoked'`, and record `last_error_message = 'Invalid university credentials. Auto-refresh halted immediately to prevent account lockout.'`.
+  - On success, updates `donor_tokens` in database, synchronizes in-memory `decryptedTokensCache.set(donor.id, freshToken)` and the `donor` reference.
+  - Retries the current course fetch with the refreshed token. Subsequent courses for this donor in the same poller execution cycle reuse `decryptedTokensCache` directly.

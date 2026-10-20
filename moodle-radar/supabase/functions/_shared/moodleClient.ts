@@ -326,3 +326,87 @@ export function getJitterDelay(minMs = 500, maxMs = 1200): Promise<void> {
   const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
   return new Promise((resolve) => setTimeout(resolve, delay))
 }
+
+
+/**
+ * 2.6 Function: /login/token.php
+ * Interacts with Moodle Mobile service gateway to issue a wstoken.
+ */
+export async function fetchMoodleToken(
+  baseUrl: string,
+  username: string,
+  password: string,
+  service = 'moodle_mobile_app',
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
+): Promise<string> {
+  const cleanBaseUrl = baseUrl.replace(/\/+$/, '')
+  const endpoint = `${cleanBaseUrl}/login/token.php`
+
+  const bodyParams = new URLSearchParams()
+  bodyParams.append('username', username)
+  bodyParams.append('password', password)
+  bodyParams.append('service', service)
+
+  let response: Response
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'User-Agent': MOODLE_CLIENT_USER_AGENT,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+      body: bodyParams.toString(),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === 'TimeoutError') {
+      throw new MoodleApiError(
+        `Request to Moodle token endpoint timed out after ${timeoutMs}ms`,
+        'TIMEOUT',
+        'timeout',
+        408
+      )
+    }
+    throw new MoodleApiError(
+      `Network error connecting to Moodle token service: ${err instanceof Error ? err.message : String(err)}`,
+      'NETWORK_ERROR',
+      'fetch_failure'
+    )
+  }
+
+  if (!response.ok) {
+    throw new MoodleApiError(
+      `Moodle token endpoint returned HTTP ${response.status} ${response.statusText}`,
+      'HTTP_ERROR',
+      'http_error',
+      response.status
+    )
+  }
+
+  const data = await response.json().catch(() => null)
+  if (!data || typeof data !== 'object') {
+    throw new MoodleApiError(
+      'Moodle token endpoint returned invalid JSON response',
+      'INVALID_RESPONSE',
+      'schema_mismatch'
+    )
+  }
+
+  if (data.error || data.errorcode) {
+    const errorMsg = data.message || data.error || 'Failed to authenticate with Moodle'
+    const errorCode = data.errorcode || 'LOGIN_ERROR'
+    const exception = data.exception || 'login_exception'
+    throw new MoodleApiError(errorMsg, errorCode, exception, response.status)
+  }
+
+  if (!data.token || typeof data.token !== 'string') {
+    throw new MoodleApiError(
+      'Moodle did not return an access token in login response',
+      'NO_TOKEN',
+      'token_missing'
+    )
+  }
+
+  return data.token
+}

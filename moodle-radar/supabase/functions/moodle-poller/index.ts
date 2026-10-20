@@ -1,9 +1,10 @@
 /**
  * Edge Function: /moodle-poller
- * Specification Reference: specs/03-edge-functions-spec.md Section 3.2
+ * Specification Reference: specs/03-edge-functions-spec.md Section 3.2 & moodle-token-auto-renewal-plan.md
  * 
  * Scheduled batch delta poller executed every 10 minutes via pg_cron
  * or on-demand diagnostic trigger from the Web Dashboard.
+ * Includes reactive self-healing with zero-lockout account protection.
  */
 
 import { createClient } from 'npm:@supabase/supabase-js@2.118.0'
@@ -29,6 +30,10 @@ import {
   cleanSnippet,
 } from '../_shared/telegramClient.ts'
 import { buildAlertKeyboard } from '../_shared/telegramBotUi.ts'
+import {
+  attemptReactiveSelfHealing,
+  DonorLockoutPreventedError,
+} from '../_shared/donorAuth.ts'
 
 Deno.serve(async (req: Request) => {
   const startTime = Date.now()
@@ -95,7 +100,7 @@ Deno.serve(async (req: Request) => {
           donor = fallback
         }
       }
-      if (!donor || donor.status !== 'active') {
+      if (!donor || (donor.status !== 'active' && !(donor.auth_mode === 'credentials' && donor.auto_refresh_enabled !== false))) {
         return errorResponse(`المساق #${targetCourse.id} لا يمتلك أي حساب متبرع نشط (أساسي أو احتياطي)`, 400, 'NO_ACTIVE_DONOR_TOKEN')
       }
 
@@ -118,8 +123,32 @@ Deno.serve(async (req: Request) => {
         )
       }
 
-      // Fetch course contents
-      const sections = await getCourseContents(donor.moodle_base_url, plainToken, targetCourse.id)
+      // Fetch course contents with reactive self-healing support
+      let sections: any[]
+      try {
+        sections = await getCourseContents(donor.moodle_base_url, plainToken, targetCourse.id)
+      } catch (err: unknown) {
+        if (
+          err instanceof MoodleApiError &&
+          err.errorCode === 'invalidtoken' &&
+          donor.auth_mode === 'credentials' &&
+          donor.auto_refresh_enabled !== false
+        ) {
+          console.warn(`[Self-Healing] Test broadcast encountered invalidtoken. Attempting reactive re-authentication...`)
+          try {
+            const healed = await attemptReactiveSelfHealing(supabase, donor, masterKey)
+            plainToken = healed.token
+            Object.assign(donor, healed.updatedDonor)
+            sections = await getCourseContents(donor.moodle_base_url, plainToken, targetCourse.id)
+          } catch (healErr: unknown) {
+            const healMsg = healErr instanceof Error ? healErr.message : String(healErr)
+            return errorResponse(`فشلت المعالجة الذاتية للتوكن: ${healMsg}`, 401, 'SELF_HEALING_FAILED')
+          }
+        } else {
+          throw err
+        }
+      }
+
       const allModules = sections.flatMap((s) => s.modules || [])
 
       // Fetch course labels (Text & Media areas / direct section announcements)
@@ -144,48 +173,42 @@ Deno.serve(async (req: Request) => {
 
       const candidates: CandidateItem[] = []
 
-      // Modules (Assignments, Resources, URLs, Folders, Labels)
+      // Extract all candidate items
       for (const mod of allModules) {
-        const modname = mod.modname
-        let itemType: 'mod_forum' | 'mod_assign' | 'mod_resource' | 'mod_url' | null = null
+        let itemType: 'mod_forum' | 'mod_assign' | 'mod_resource' | 'mod_url' = 'mod_resource'
+        if (mod.modname === 'assign') itemType = 'mod_assign'
+        else if (mod.modname === 'url') itemType = 'mod_url'
+        else if (mod.modname === 'label') itemType = 'mod_forum'
+        else if (mod.modname === 'forum') itemType = 'mod_forum'
 
-        if (modname === 'assign') itemType = 'mod_assign'
-        else if (modname === 'resource' || modname === 'folder') itemType = 'mod_resource'
-        else if (modname === 'url') itemType = 'mod_url'
-        else if (modname === 'forum') itemType = 'mod_forum'
-        else if (modname === 'label') itemType = 'mod_forum'
-
-        if (!itemType) continue
-
-        // 1. Text & Media area announcement (mod_label)
-        if (modname === 'label') {
+        // 1. Text & Media Areas (labels)
+        if (mod.modname === 'label') {
           const labelData = labelMap.get(mod.id) || labelMap.get(mod.instance)
           const timemodified = labelData?.timemodified || 0
-          const rawText = labelData?.intro || mod.description || ''
-          const previewSnippet = cleanSnippet(rawText)
-
+          const snippet = cleanSnippet(labelData?.intro || mod.name)
+          const itemUrl = `${donor.moodle_base_url.replace(/\/+$/, '')}/course/view.php?id=${targetCourse.id}`
           candidates.push({
             itemType: 'mod_forum',
-            itemTitle: mod.name || 'إعلان / ملاحظة هامة',
+            itemTitle: mod.name || 'إعلان في ساحة المساق',
             timemodified,
-            itemUrl: `${donor.moodle_base_url.replace(/\/+$/, '')}/course/view.php?id=${targetCourse.id}`,
-            previewSnippet,
+            itemUrl,
+            previewSnippet: snippet,
           })
           continue
         }
 
         // 2. Forum announcements
-        if (modname === 'forum') {
+        if (mod.modname === 'forum') {
           try {
             const forumId = mod.instance || mod.id
             const discussions = await getForumDiscussions(donor.moodle_base_url, plainToken, forumId, 0, 5)
             for (const disc of discussions) {
-              const discTime = disc.timemodified || disc.created || 0
+              const discUrl = `${donor.moodle_base_url.replace(/\/+$/, '')}/mod/forum/discuss.php?d=${disc.id}`
               candidates.push({
                 itemType: 'mod_forum',
                 itemTitle: disc.name,
-                timemodified: discTime,
-                itemUrl: `${donor.moodle_base_url.replace(/\/+$/, '')}/mod/forum/discuss.php?d=${disc.id}`,
+                timemodified: disc.timemodified,
+                itemUrl: discUrl,
                 author: disc.userfullname,
                 previewSnippet: cleanSnippet(disc.message),
               })
@@ -252,7 +275,7 @@ Deno.serve(async (req: Request) => {
       filteredCandidates.sort((a, b) => b.timemodified - a.timemodified)
       const selectedItem = filteredCandidates[0]
 
-      // Fetch active subscribers for this course
+      // Fetch subscribed active bot users for this course
       const { data: subscriberRows } = await supabase
         .from('subscriptions')
         .select('telegram_id, bot_users(is_paused)')
@@ -264,32 +287,25 @@ Deno.serve(async (req: Request) => {
 
       if (activeChatIds.length === 0) {
         return jsonResponse({
-          success: true,
-          deliveredCount: 0,
-          failureCount: 0,
-          recipientsCount: 0,
-          itemTitle: selectedItem.itemTitle,
-          itemType: selectedItem.itemType,
-          message: `تم رصد أحدث عنصر: "${selectedItem.itemTitle}"، ولكن لا يوجد أي طالب مشترك في هذا المساق حالياً في بوت تليجرام. اشترك في المساق عبر البوت أولاً لتصلك الرسالة!`,
+          success: false,
+          message: `تم العثور على العنصر "${selectedItem.itemTitle}"، ولكن لا يوجد أي مشترك نشط في هذا المساق حالياً.`,
         })
       }
 
-      // Format alert message
-      const alertHtml = `<b>[🧪 إرسال تجريبي / اختبار]</b>\n` + formatMoodleAlertMessage({
+      const messageHtml = formatMoodleAlertMessage({
         courseName: targetCourse.fullname,
         courseShortname: targetCourse.shortname,
         cohortTag: targetCourse.cohort_tag,
         eventType: 'EVENT_CREATED',
         itemType: selectedItem.itemType,
-        itemTitle: selectedItem.itemTitle,
+        itemTitle: `[تجريبي] ${selectedItem.itemTitle}`,
         itemUrl: selectedItem.itemUrl,
         author: selectedItem.author,
         dueDate: selectedItem.dueDate,
         previewSnippet: selectedItem.previewSnippet,
       })
 
-      // Dispatch
-      const dispatchRes = await dispatchBatchedMessages(botToken, activeChatIds, alertHtml, {
+      const dispatchRes = await dispatchBatchedMessages(botToken, activeChatIds, messageHtml, {
         reply_markup: {
           inline_keyboard: buildAlertKeyboard(selectedItem.itemUrl),
         },
@@ -323,14 +339,14 @@ Deno.serve(async (req: Request) => {
     // -------------------------------------------------------------------------
     // Mode B: Standard Automated Polling Engine (Scheduled Cron / Manual Poll)
     // -------------------------------------------------------------------------
-    // 3. Cache decrypted donor tokens
+    // In-memory cache for decrypted/refreshed donor tokens (Amendment 3: Race condition prevention)
     const decryptedTokensCache = new Map<string, string>()
     const circuitBreaker = new CircuitBreaker({ maxConsecutiveFailures: 3 })
 
     let eventsDetectedCount = 0
     let messagesDispatchedCount = 0
 
-    // 4. Sequential polling loop with jitter delay
+    // Sequential polling loop with jitter delay
     for (let i = 0; i < courses.length; i++) {
       const course = courses[i]
 
@@ -346,8 +362,16 @@ Deno.serve(async (req: Request) => {
       }
 
       let donor = course.donor_tokens
+      // If donor was reactively healed in this execution cycle, treat as active
+      if (donor && decryptedTokensCache.has(donor.id)) {
+        donor.status = 'active'
+      }
+
       if (!donor || donor.status !== 'active') {
         const fallback = course.fallback_donor
+        if (fallback && decryptedTokensCache.has(fallback.id)) {
+          fallback.status = 'active'
+        }
         if (fallback && fallback.status === 'active') {
           console.log(
             `Course #${course.id}: Primary donor (${donor?.id || 'none'}) is inactive (${donor?.status}). Using fallback donor #${fallback.id} (${fallback.label}).`
@@ -361,7 +385,7 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Retrieve or decrypt token
+      // Retrieve or decrypt token (reusing cached refreshed tokens immediately)
       let plainToken: string
       try {
         if (decryptedTokensCache.has(donor.id)) {
@@ -390,104 +414,148 @@ Deno.serve(async (req: Request) => {
         continue
       }
 
-      // 5. Query Moodle modules & contents
+      // 5. Query Moodle modules & contents with reactive self-healing
       const detectedEvents: DeltaEvent[] = []
-      try {
-        const sections = await getCourseContents(donor.moodle_base_url, plainToken, course.id)
-        circuitBreaker.recordSuccess()
+      let pollSuccessful = false
 
-        // Gather all module items
-        const allModules = sections.flatMap((s) => s.modules || [])
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const sections = await getCourseContents(donor.moodle_base_url, plainToken, course.id)
+          circuitBreaker.recordSuccess()
 
-        // Fetch course labels if any (text & media area announcements)
-        const labelMap = new Map<number, any>()
-        if (allModules.some((m) => m.modname === 'label')) {
-          const labels = await getCourseLabels(donor.moodle_base_url, plainToken, course.id)
-          for (const l of labels) {
-            if (l.coursemodule) labelMap.set(l.coursemodule, l)
-            if (l.id) labelMap.set(l.id, l)
-          }
-        }
+          // Gather all module items
+          const allModules = sections.flatMap((s) => s.modules || [])
 
-        // Fetch existing watermarks for this course
-        const { data: storedWatermarks } = await supabase
-          .from('course_items_state')
-          .select('composite_id, course_id, item_type, timemodified')
-          .eq('course_id', course.id)
-
-        const watermarkMap = new Map(
-          (storedWatermarks || []).map((w) => [w.composite_id, w])
-        )
-
-        // Evaluate modules (assignments, files, resources, labels)
-        for (const mod of allModules) {
-          if (mod.modname === 'label') {
-            const labelData = labelMap.get(mod.id) || labelMap.get(mod.instance)
-            if (labelData) {
-              (mod as any).timemodified = labelData.timemodified;
-              (mod as any).intro = labelData.intro;
+          // Fetch course labels if any (text & media area announcements)
+          const labelMap = new Map<number, any>()
+          if (allModules.some((m) => m.modname === 'label')) {
+            const labels = await getCourseLabels(donor.moodle_base_url, plainToken, course.id)
+            for (const l of labels) {
+              if (l.coursemodule) labelMap.set(l.coursemodule, l)
+              if (l.id) labelMap.set(l.id, l)
             }
           }
 
-          let modItemType: 'mod_forum' | 'mod_assign' | 'mod_resource' | 'mod_url' = 'mod_resource'
-          if (mod.modname === 'assign') modItemType = 'mod_assign'
-          else if (mod.modname === 'url') modItemType = 'mod_url'
-          else if (mod.modname === 'label') modItemType = 'mod_forum'
+          // Fetch existing watermarks for this course
+          const { data: storedWatermarks } = await supabase
+            .from('course_items_state')
+            .select('composite_id, course_id, item_type, timemodified')
+            .eq('course_id', course.id)
 
-          const delta = evaluateModuleDelta(
-            course.id,
-            mod,
-            watermarkMap.get(buildCompositeId(course.id, modItemType, mod.id)),
-            {
-              filter_forum: course.filter_forum,
-              filter_assign: course.filter_assign,
-              filter_resources: course.filter_resources,
-            }
+          const watermarkMap = new Map(
+            (storedWatermarks || []).map((w) => [w.composite_id, w])
           )
-          if (delta) {
-            detectedEvents.push(delta)
-          }
 
-          // If module is a forum and forum filter is enabled, check recent announcements
-          if (mod.modname === 'forum' && course.filter_forum) {
-            try {
-              const forumId = mod.instance || mod.id
-              const discussions = await getForumDiscussions(donor.moodle_base_url, plainToken, forumId, 0, 5)
-              for (const disc of discussions) {
-                const discDelta = evaluateDiscussionDelta(
-                  course.id,
-                  disc,
-                  watermarkMap.get(buildCompositeId(course.id, 'mod_forum', disc.id)),
-                  {
-                    filter_forum: course.filter_forum,
-                    filter_assign: course.filter_assign,
-                    filter_resources: course.filter_resources,
-                  }
-                )
-                if (discDelta) {
-                  detectedEvents.push(discDelta)
-                }
+          // Evaluate modules (assignments, files, resources, labels)
+          for (const mod of allModules) {
+            if (mod.modname === 'label') {
+              const labelData = labelMap.get(mod.id) || labelMap.get(mod.instance)
+              if (labelData) {
+                (mod as any).timemodified = labelData.timemodified;
+                (mod as any).intro = labelData.intro;
               }
-            } catch (forumErr) {
-              console.warn(`Could not fetch forum ${mod.id} discussions:`, forumErr)
+            }
+
+            let modItemType: 'mod_forum' | 'mod_assign' | 'mod_resource' | 'mod_url' = 'mod_resource'
+            if (mod.modname === 'assign') modItemType = 'mod_assign'
+            else if (mod.modname === 'url') modItemType = 'mod_url'
+            else if (mod.modname === 'label') modItemType = 'mod_forum'
+
+            const delta = evaluateModuleDelta(
+              course.id,
+              mod,
+              watermarkMap.get(buildCompositeId(course.id, modItemType, mod.id)),
+              {
+                filter_forum: course.filter_forum,
+                filter_assign: course.filter_assign,
+                filter_resources: course.filter_resources,
+              }
+            )
+            if (delta) {
+              detectedEvents.push(delta)
+            }
+
+            // If module is a forum and forum filter is enabled, check recent announcements
+            if (mod.modname === 'forum' && course.filter_forum) {
+              try {
+                const forumId = mod.instance || mod.id
+                const discussions = await getForumDiscussions(donor.moodle_base_url, plainToken, forumId, 0, 5)
+                for (const disc of discussions) {
+                  const discDelta = evaluateDiscussionDelta(
+                    course.id,
+                    disc,
+                    watermarkMap.get(buildCompositeId(course.id, 'mod_forum', disc.id)),
+                    {
+                      filter_forum: course.filter_forum,
+                      filter_assign: course.filter_assign,
+                      filter_resources: course.filter_resources,
+                    }
+                  )
+                  if (discDelta) {
+                    detectedEvents.push(discDelta)
+                  }
+                }
+              } catch (forumErr) {
+                console.warn(`Could not fetch forum ${mod.id} discussions:`, forumErr)
+              }
             }
           }
-        }
-      } catch (coursePollErr: unknown) {
-        console.error(`Error polling course #${course.id}:`, coursePollErr)
-        circuitBreaker.recordFailure(coursePollErr)
 
-        // Check if token was revoked or expired on Moodle
-        if (coursePollErr instanceof MoodleApiError && coursePollErr.errorCode === 'invalidtoken') {
-          await supabase
-            .from('donor_tokens')
-            .update({
-              status: 'revoked',
-              last_error_message: 'Moodle rejected token: invalidtoken',
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', donor.id)
+          pollSuccessful = true
+          break // Success, exit retry loop
+        } catch (coursePollErr: unknown) {
+          console.error(`Error polling course #${course.id} (attempt ${attempt + 1}):`, coursePollErr)
+
+          // Intercept invalidtoken exception for reactive self-healing (Amendments 1, 2, 3)
+          if (
+            coursePollErr instanceof MoodleApiError &&
+            coursePollErr.errorCode === 'invalidtoken' &&
+            attempt === 0
+          ) {
+            if (donor.auth_mode === 'credentials' && donor.auto_refresh_enabled !== false) {
+              console.warn(
+                `[Self-Healing] Detected invalidtoken for donor "${donor.label}" on course #${course.id}. Initiating reactive re-authentication...`
+              )
+              try {
+                const healed = await attemptReactiveSelfHealing(supabase, donor, masterKey)
+                // Race condition safeguard: update cache & local reference immediately
+                plainToken = healed.token
+                decryptedTokensCache.set(donor.id, plainToken)
+                Object.assign(donor, healed.updatedDonor)
+                console.log(`[Self-Healing] Successfully obtained fresh token for donor "${donor.label}". Retrying course #${course.id}...`)
+                continue // Retry immediately with fresh token!
+              } catch (healErr: unknown) {
+                if (healErr instanceof DonorLockoutPreventedError) {
+                  console.error(`[Zero-Lockout SafeGuard] ${healErr.message}`)
+                } else {
+                  console.error(`[Self-Healing] Failed to re-authenticate donor "${donor.label}":`, healErr)
+                }
+                decryptedTokensCache.delete(donor.id)
+                circuitBreaker.recordFailure(coursePollErr)
+                break // Don't retry
+              }
+            } else {
+              // Manual token or self-healing disabled: mark revoked immediately
+              await supabase
+                .from('donor_tokens')
+                .update({
+                  status: 'revoked',
+                  last_error_message: 'Moodle rejected token: invalidtoken',
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', donor.id)
+              decryptedTokensCache.delete(donor.id)
+              circuitBreaker.recordFailure(coursePollErr)
+              break
+            }
+          }
+
+          circuitBreaker.recordFailure(coursePollErr)
+          break
         }
+      }
+
+      if (!pollSuccessful) {
         continue
       }
 

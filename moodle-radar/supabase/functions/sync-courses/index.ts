@@ -1,14 +1,15 @@
 /**
  * Edge Function: /sync-courses
- * Specification Reference: specs/03-edge-functions-spec.md Section 3.1
+ * Specification Reference: specs/03-edge-functions-spec.md Section 3.1 & moodle-token-auto-renewal-plan.md
  * 
- * Validates donor token via Moodle API, encrypts it via AES-256-GCM,
- * registers donor in PostgreSQL, and syncs enrolled courses.
+ * Validates donor token via Moodle API (or fetches it via student credentials),
+ * encrypts token and credentials via AES-256-GCM, registers donor in PostgreSQL,
+ * and syncs enrolled courses.
  */
 
 import { createClient } from 'npm:@supabase/supabase-js@2.118.0'
 import { handleCors, jsonResponse, errorResponse } from '../_shared/cors.ts'
-import { getSiteInfo, getUsersCourses, MoodleApiError } from '../_shared/moodleClient.ts'
+import { getSiteInfo, getUsersCourses, fetchMoodleToken, MoodleApiError } from '../_shared/moodleClient.ts'
 import { encryptToken } from '../_shared/crypto.ts'
 
 Deno.serve(async (req: Request) => {
@@ -22,19 +23,69 @@ Deno.serve(async (req: Request) => {
 
   try {
     const body = await req.json().catch(() => ({}))
-    const { donor_id, label, moodle_base_url, wstoken } = body
+    const {
+      donor_id,
+      label,
+      moodle_base_url,
+      auth_mode,
+      username,
+      password,
+      moodle_service,
+      wstoken,
+    } = body
 
     if (!label || typeof label !== 'string' || !label.trim()) {
       return errorResponse('Missing required parameter: label', 400, 'INVALID_LABEL')
     }
 
-    if (!wstoken || typeof wstoken !== 'string' || !wstoken.trim()) {
-      return errorResponse('Missing required parameter: wstoken', 400, 'INVALID_WSTOKEN')
-    }
+    const isCredentialsMode = auth_mode === 'credentials'
+    let resolvedToken = ''
 
     const cleanBaseUrl = (moodle_base_url && typeof moodle_base_url === 'string')
       ? moodle_base_url.trim().replace(/\/+$/, '')
       : 'https://moodle.university.edu'
+
+    const masterKey = Deno.env.get('MASTER_ENCRYPTION_KEY') || Deno.env.get('ENCRYPTION_MASTER_KEY') || ''
+    if (!masterKey) {
+      throw new Error('Master encryption key is not configured in Supabase environment secrets.')
+    }
+
+    let encryptedPasswordResult = null
+
+    if (isCredentialsMode) {
+      if (!username || typeof username !== 'string' || !username.trim()) {
+        return errorResponse('يرجى إدخال اسم المستخدم لحساب مودل الجامعي', 400, 'INVALID_USERNAME')
+      }
+      if (!password || typeof password !== 'string' || !password.trim()) {
+        return errorResponse('يرجى إدخال كلمة المرور لحساب مودل الجامعي', 400, 'INVALID_PASSWORD')
+      }
+
+      const serviceName = (moodle_service && typeof moodle_service === 'string' && moodle_service.trim())
+        ? moodle_service.trim()
+        : 'moodle_mobile_app'
+
+      // Authenticate with Moodle Mobile service gateway
+      try {
+        resolvedToken = await fetchMoodleToken(cleanBaseUrl, username.trim(), password.trim(), serviceName)
+      } catch (loginErr: unknown) {
+        if (loginErr instanceof MoodleApiError) {
+          const code = (loginErr.errorCode || '').toLowerCase()
+          if (code === 'invalidlogin' || code === 'login_error') {
+            return errorResponse('فشل تسجيل الدخول: اسم المستخدم أو كلمة المرور غير صحيحة.', 401, 'INVALID_LOGIN')
+          }
+          return errorResponse(`فشل المصادقة مع مودل (${loginErr.errorCode}): ${loginErr.message}`, 400, 'MOODLE_LOGIN_ERROR')
+        }
+        return errorResponse(`خطأ أثناء الاتصال بمودل: ${loginErr instanceof Error ? loginErr.message : String(loginErr)}`, 400, 'MOODLE_CONNECTION_ERROR')
+      }
+
+      // Encrypt password via AES-256-GCM for opt-in self-healing vault
+      encryptedPasswordResult = await encryptToken(password.trim(), masterKey)
+    } else {
+      if (!wstoken || typeof wstoken !== 'string' || !wstoken.trim()) {
+        return errorResponse('Missing required parameter: wstoken', 400, 'INVALID_WSTOKEN')
+      }
+      resolvedToken = wstoken.trim()
+    }
 
     // Initialize elevated Supabase client
     const supabaseUrl = Deno.env.get('SUPABASE_URL') || ''
@@ -71,7 +122,7 @@ Deno.serve(async (req: Request) => {
     // 1. Handshake with Moodle via core_webservice_get_site_info
     let siteInfo
     try {
-      siteInfo = await getSiteInfo(cleanBaseUrl, wstoken.trim())
+      siteInfo = await getSiteInfo(cleanBaseUrl, resolvedToken)
     } catch (moodleErr: unknown) {
       const msg = moodleErr instanceof MoodleApiError
         ? moodleErr.message
@@ -84,21 +135,18 @@ Deno.serve(async (req: Request) => {
     // Verify that the Moodle userid matches existing donor to prevent account mixing
     if (targetDonor && targetDonor.moodle_user_id && siteInfo.userid !== targetDonor.moodle_user_id) {
       return errorResponse(
-        `تعذر تحديث التوكن: رمز الوصول الجديد ينتمي لمستخدم مودل آخر (${siteInfo.fullname} - #${siteInfo.userid})، بينما هذا السجل مرتبط بـ (${targetDonor.moodle_user_fullname || 'الطالب'} - #${targetDonor.moodle_user_id}). يرجى إدخال توكن لنفس الطالب أو إضافة متبرع جديد.`,
+        `تعذر تحديث التوكن: رمز الوصول الجديد ينتمي لمستخدم مودل آخر (${siteInfo.fullname} - #${siteInfo.userid})، بينما هذا السجل مرتبط بـ (${targetDonor.moodle_user_fullname || 'الطالب'} - #${targetDonor.moodle_user_id}). يرجى إدخال بيانات نفس الطالب أو إضافة متبرع جديد.`,
         400,
         'DONOR_ACCOUNT_MISMATCH'
       )
     }
 
     // 2. Encrypt token via AES-256-GCM
-    const masterKey = Deno.env.get('MASTER_ENCRYPTION_KEY') || Deno.env.get('ENCRYPTION_MASTER_KEY') || ''
-    if (!masterKey) {
-      throw new Error('Master encryption key is not configured in Supabase environment secrets.')
-    }
-    const encrypted = await encryptToken(wstoken.trim(), masterKey)
+    const encrypted = await encryptToken(resolvedToken, masterKey)
 
     // 3. Save or update donor token in donor_tokens table
-    const donorPayload = {
+    const nowIso = new Date().toISOString()
+    const donorPayload: Record<string, any> = {
       label: label.trim(),
       moodle_user_id: siteInfo.userid,
       moodle_user_fullname: siteInfo.fullname,
@@ -107,9 +155,25 @@ Deno.serve(async (req: Request) => {
       iv: encrypted.iv_hex,
       auth_tag: encrypted.auth_tag_hex,
       status: 'active',
-      last_validated_at: new Date().toISOString(),
+      auth_mode: isCredentialsMode ? 'credentials' : 'token',
+      last_validated_at: nowIso,
       last_error_message: null,
-      updated_at: new Date().toISOString(),
+      updated_at: nowIso,
+    }
+
+    if (isCredentialsMode && encryptedPasswordResult) {
+      donorPayload.username = username.trim()
+      donorPayload.encrypted_password = encryptedPasswordResult.encrypted_token_hex
+      donorPayload.password_iv = encryptedPasswordResult.iv_hex
+      donorPayload.password_auth_tag = encryptedPasswordResult.auth_tag_hex
+      donorPayload.moodle_service = (moodle_service && typeof moodle_service === 'string' && moodle_service.trim())
+        ? moodle_service.trim()
+        : 'moodle_mobile_app'
+      donorPayload.auto_refresh_enabled = true
+      donorPayload.last_refreshed_at = nowIso
+    } else if (!isCredentialsMode) {
+      // Manual token mode: auto-refresh is disabled
+      donorPayload.auto_refresh_enabled = false
     }
 
     let donor: any = null
@@ -142,12 +206,12 @@ Deno.serve(async (req: Request) => {
     // 4. Discover enrolled courses from Moodle
     let enrolledCourses = []
     try {
-      enrolledCourses = await getUsersCourses(cleanBaseUrl, wstoken.trim(), siteInfo.userid)
+      enrolledCourses = await getUsersCourses(cleanBaseUrl, resolvedToken, siteInfo.userid)
     } catch (courseErr: unknown) {
       console.warn('Could not auto-fetch enrolled courses:', courseErr)
     }
 
-    // 6. Sync courses into courses table
+    // 5. Sync courses into courses table
     const syncedCourses = []
     for (const c of enrolledCourses) {
       // Check if course already exists
@@ -198,6 +262,7 @@ Deno.serve(async (req: Request) => {
       donor_id: donor.id,
       moodle_user_fullname: siteInfo.fullname,
       moodle_user_id: siteInfo.userid,
+      auth_mode: donor.auth_mode,
       synced_courses_count: syncedCourses.length,
       courses: syncedCourses,
       is_renewal: isRenewal,

@@ -252,3 +252,34 @@ stateDiagram-v2
 * **Circuit Action:**
   - Upon 3 consecutive failures across distinct courses, the function immediately updates `donor_tokens.last_error_message` with the incident summary and terminates execution.
   - The circuit resets on the subsequent 10-minute cron cycle.
+
+
+---
+
+### 2.5 Function: `/login/token.php` (Mobile Authentication Gateway)
+* **Purpose:** Issues mobile web service tokens using student credentials for opt-in reactive self-healing.
+* **HTTP Method:** `POST`
+* **Headers:** `User-Agent: MoodleMobile/4.4.0 (Android; SDK 34; wv) Mobile`, `Content-Type: application/x-www-form-urlencoded`
+* **Parameters:**
+  * `username`: Student university ID / login
+  * `password`: Student university password
+  * `service`: Service shortname (default: `moodle_mobile_app`)
+* **Success Payload:**
+  ```json
+  { "token": "a1b2c3d4e5f6...", "privatetoken": "..." }
+  ```
+* **Error Payload:**
+  ```json
+  { "error": "Invalid login, please try again", "errorcode": "invalidlogin" }
+  ```
+
+---
+
+### 4.3 Reactive Self-Healing & Zero-Lockout Protocol
+1. **Trigger Condition:** The poller intercepts `errorcode === 'invalidtoken'` while executing Moodle REST requests for a course.
+2. **Zero-Lockout Protection:**
+   - If `/login/token.php` returns `invalidlogin` or authentication failure, **halt immediately on attempt #1**.
+   - Set `auto_refresh_enabled = FALSE`, set donor status to `revoked`, record descriptive error, and alert Super Admin to prevent student university account lockouts.
+3. **Runtime Cache Synchronization:**
+   - On successful re-authentication, update in-memory `decryptedTokensCache` and the donor reference object immediately.
+   - Subsequent courses assigned to this donor in the same execution cycle reuse the refreshed token without redundant re-authentications.
